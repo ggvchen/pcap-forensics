@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 分析产物（样本数据不入库）
+objects/
+report/
+pcap_objects/
+pcap_report/
+*.pcap
+*.pcapng
+*.pkl
+pcapkit_cache/
