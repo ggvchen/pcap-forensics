@@ -112,12 +112,38 @@ HTTP 实体在解析层就解开了，所以 `grep` / `export` / `report` / `str
 - `stream` 编号是本工具按首次出现顺序分配的，与 tshark 的 `tcp.stream` 不一定一致，
   写报告时注明来源即可。
 - 只处理 HTTP/1.x；HTTP/2 需 h2 解码。
+- **在装了终端防护的 Windows 上，导出的木马文件可能被直接隔离或锁定**
+  （实测 Defender 会把含 `GIF89a + 一句话` 的 `.bin` 判定为威胁，`open()` 报 EINVAL，
+  甚至删除源文件）。建议把 `-d` 指到杀软排除目录，或改用 `stream <ID> --raw`
+  做字节级取证；本仓库的测试夹具也因此用片段拼接载荷，不写字面量。
+
+## 测试
+
+37 个用例，纯标准库、自造样本，不需要任何 pcap 文件：
+
+```bash
+python tests/test_pcapkit.py          # 或 python -m unittest discover -s tests -v
+```
+
+覆盖范围：
+
+| 分类 | 覆盖点 |
+|---|---|
+| 容器格式 | pcap 大小端、纳秒精度、pcapng、链路层 raw IP / Linux SLL / VLAN / IPv6 |
+| TCP 重组 | 乱序（后段先到）、完全/部分重传、空洞记录、keep-alive 多报文 |
+| 解码 | gzip、zlib deflate、raw deflate、chunked、chunked+gzip、无头嗅探、截断容错、br 提示 |
+| 取证 | 八段签名命中、URL 编码 payload、404 率判扫描、multipart 木马拆分、报告结构 |
+| CLI | 六个子命令退出码、`--no-cache` 两种位置、`stream` 默认解码 vs `--raw` 字节一致性、异常输入 |
+
+其中 `test_out_of_order`、`test_keepalive_multi_message` 和 `test_url_encoded_payload_matched`
+是三个真实 bug 的回归锚点，改动重组/解析逻辑时必须先跑过。
 
 ## 目录结构
 
 ```
 SKILL.md                        # 技能主流程与硬规则
 scripts/pcapkit.py              # 零依赖分析工具（单文件）
+tests/test_pcapkit.py           # 37 个回归用例（自造样本）
 references/wireshark-filters.md # Wireshark / tshark 过滤器速查
 references/report-template.md   # 取证报告模板
 ```

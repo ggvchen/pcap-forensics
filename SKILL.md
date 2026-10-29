@@ -95,6 +95,11 @@ python scripts/pcapkit.py report 流量.pcap -d report/     # 生成 report.md
 8. **>500MB 别用纯 Python 硬啃**，走 tshark + `--export-objects`。
 9. **本工具的 stream 编号 ≠ tshark 的 tcp.stream**，报告里注明编号来源便于复核。
 10. **结论要有包级证据**（stream 号、时间、原始字节），不要只给判断。
+11. **Windows 上的终端防护会吃掉证据**。导出的木马可能被当场隔离，连分析脚本
+    本身都可能被删（含完整一句话的文件会被判威胁）。导出目录要加排除项，
+    或改在 Linux/WSL 里做；需要保真时用 `stream <ID> --raw` 存原始字节。
+12. **改重组/解析逻辑后先跑 `python tests/test_pcapkit.py`**（37 个用例，自造样本，
+    覆盖乱序、重传、keep-alive、gzip/chunked、编码注入），别拿真实样本赌。
 
 ## 常用扩展场景
 

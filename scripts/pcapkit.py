@@ -31,7 +31,7 @@ import zlib
 
 HTTP_METHODS = (b"GET", b"POST", b"HEAD", b"PUT", b"DELETE", b"OPTIONS",
                 b"PATCH", b"TRACE", b"CONNECT")
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 # ---------------------------------------------------------------- 抓包文件解析
@@ -254,26 +254,13 @@ def build_streams(path):
         ep = (src, sp)
         d = st.dirs.get(ep)
         if d is None:
-            d = {"buf": bytearray(), "next": None, "packets": 0}
+            d = {"segs": [], "packets": 0}
             st.dirs[ep] = d
-        if flags & 0x02 and not data and d["next"] is None:
-            d["next"] = seq + 1
         if not data:
             continue
         d["packets"] += 1
-        if d["next"] is None:
-            d["next"] = seq
-        if seq >= d["next"]:
-            if seq > d["next"]:
-                d["buf"].extend(b"\x00" * (seq - d["next"]))
-                st.gaps += 1
-            d["buf"].extend(data)
-            d["next"] = seq + len(data)
-        else:
-            end = seq + len(data)
-            if end > d["next"]:
-                d["buf"].extend(data[d["next"] - seq:])
-                d["next"] = end
+        # 只记 (seq, payload)，最后按序号归并。边收边拼会在「后段先到」时丢掉前段。
+        d["segs"].append((seq, data))
 
     meta = {
         "path": os.path.abspath(path),
@@ -286,10 +273,59 @@ def build_streams(path):
                   for (p, lo, hi), n in ports.most_common(30)],
     }
     for st in streams.values():
-        st.dirs = collections.OrderedDict(
-            (ep, {"buf": bytes(d["buf"]), "next": d["next"], "packets": d["packets"]})
-            for ep, d in st.dirs.items())
+        newdirs = collections.OrderedDict()
+        total_gaps = 0
+        for ep, d in st.dirs.items():
+            buf, g = _assemble(d["segs"])
+            total_gaps += g
+            newdirs[ep] = {"buf": buf, "packets": d["packets"]}
+        st.dirs = newdirs
+        st.gaps = total_gaps
     return streams, meta
+
+
+def _assemble(segs, max_span=64 * 1024 * 1024):
+    """把 (seq, payload) 列表归并成字节流，返回 (buffer, 空洞数)。
+
+    以最小序号为原点，空洞填 0，重叠部分以先写入者为准（重传内容相同，
+    不同则以先到的为准，避免后到的乱序片段覆盖正确数据）。
+    """
+    if not segs:
+        return b"", 0
+    base = min(s for s, _ in segs)
+    end = max(s + len(p) for s, p in segs)
+    span = end - base
+    if span <= 0:
+        return b"", 0
+    if span > max_span:                       # 序号异常（如抓到半个连接），退化为顺序拼接
+        out = bytearray()
+        cur = None
+        for s, p in segs:
+            if cur is None:
+                cur = s
+            if s >= cur:
+                out += p
+                cur = s + len(p)
+            elif s + len(p) > cur:
+                out += p[cur - s:]
+                cur = s + len(p)
+        return bytes(out), 0
+    buf = bytearray(span)
+    covered = bytearray(span)
+    for s, p in segs:
+        off = s - base
+        if off < 0:
+            continue
+        buf[off:off + len(p)] = p
+        covered[off:off + len(p)] = b"\x01" * len(p)
+    gaps, in_gap = 0, False
+    for c in covered:
+        if c:
+            in_gap = False
+        elif not in_gap:
+            gaps += 1
+            in_gap = True
+    return bytes(buf), gaps
 
 
 def _cache_key(path):
@@ -381,6 +417,7 @@ def parse_http(buf):
     b = buf
     pos = 0
     while pos < len(b):
+        start = pos
         head_end = b.find(b"\r\n\r\n", pos)
         if head_end < 0:
             break
@@ -420,8 +457,8 @@ def parse_http(buf):
             "truncated": len(b) - nxt < 0,
         })
         pos = nxt
-        if pos <= body_off:
-            break
+        if pos <= start:      # 无 body 的报文 pos == body_off，这里必须比 start，
+            break             # 否则 keep-alive 连接上的后续报文会被整段丢掉
     return out
 
 
@@ -1005,24 +1042,27 @@ def cmd_report(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="零依赖 PCAP 取证工具")
     ap.add_argument("--no-cache", action="store_true", help="禁用中间结果缓存")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--no-cache", action="store_true", default=argparse.SUPPRESS,
+                        help="禁用中间结果缓存")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("summary", help="文件概览与会话统计")
+    p = sub.add_parser("summary", help="文件概览与会话统计", parents=[common])
     p.add_argument("pcap")
     p.set_defaults(func=cmd_summary)
 
-    p = sub.add_parser("http", help="列出 HTTP 请求")
+    p = sub.add_parser("http", help="列出 HTTP 请求", parents=[common])
     p.add_argument("pcap")
     p.add_argument("--csv")
     p.add_argument("--limit", type=int, default=60)
     p.set_defaults(func=cmd_http)
 
-    p = sub.add_parser("grep", help="关键字检索")
+    p = sub.add_parser("grep", help="关键字检索", parents=[common])
     p.add_argument("pcap")
     p.add_argument("patterns", nargs="+")
     p.set_defaults(func=cmd_grep)
 
-    p = sub.add_parser("stream", help="还原指定 TCP 流（默认解码 HTTP 与 gzip）")
+    p = sub.add_parser("stream", help="还原指定 TCP 流（默认解码 HTTP 与 gzip）", parents=[common])
     p.add_argument("pcap")
     p.add_argument("id", type=int)
     p.add_argument("--limit", type=int, default=8000, help="每个报文最多显示多少字节")
@@ -1030,7 +1070,7 @@ def main(argv=None):
                    help="输出线上原始字节（不做换行转换，可重定向为 .bin）")
     p.set_defaults(func=cmd_stream)
 
-    p = sub.add_parser("export", help="导出请求/响应体")
+    p = sub.add_parser("export", help="导出请求/响应体", parents=[common])
     p.add_argument("pcap")
     p.add_argument("-d", "--dir", default="pcap_objects")
     p.add_argument("--all", action="store_true", help="连 404 页面和全部 POST 体一起导出")
@@ -1038,7 +1078,7 @@ def main(argv=None):
     p.add_argument("--min-size", type=int, default=200)
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("report", help="生成 Markdown 报告")
+    p = sub.add_parser("report", help="生成 Markdown 报告", parents=[common])
     p.add_argument("pcap")
     p.add_argument("-d", "--dir", default="pcap_report")
     p.add_argument("--max-events", type=int, default=40)
