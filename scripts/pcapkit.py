@@ -323,6 +323,9 @@ def load(path, use_cache=True):
 
 # ---------------------------------------------------------------- HTTP 解码
 
+DECODE_ISSUES = collections.Counter()   # br/zstd 未解压、gzip 解压失败等，汇总后提示
+
+
 def _dechunk(body):
     out = bytearray()
     i = 0
@@ -340,18 +343,26 @@ def _dechunk(body):
 
 
 def _inflate(body, enc):
+    """按声明解压；声明缺失或撒谎时退回魔术字节嗅探（1f8b / 78xx）。"""
     enc = (enc or "").lower()
-    if "gzip" in enc:
+    if "br" in enc or "zstd" in enc or "compress" in enc:
+        DECODE_ISSUES[enc.strip() or "unknown"] += 1
+        return body
+    if "gzip" in enc or body[:2] == b"\x1f\x8b":
         try:
             return gzip.decompress(body)
         except Exception:
             pass
-    if "deflate" in enc or "gzip" in enc:
+    # zlib 头第二字节是固定校验位组合，用它避免把普通文本误判成 deflate
+    looks_zlib = body[:1] == b"\x78" and body[1:2] in (b"\x01", b"\x9c", b"\xda", b"\x5e")
+    if "deflate" in enc or "gzip" in enc or looks_zlib:
         for wbits in (16 + zlib.MAX_WBITS, zlib.MAX_WBITS, -zlib.MAX_WBITS):
             try:
                 return zlib.decompressobj(wbits).decompress(body)
             except Exception:
                 continue
+    if ("gzip" in enc or "deflate" in enc) and body:
+        DECODE_ISSUES["解压失败(可能被截断)"] += 1
     return body
 
 
@@ -625,6 +636,10 @@ def cmd_summary(args):
                 st.sid, eps[0][0], eps[0][1], eps[1][0], eps[1][1],
                 human(st.nbytes), st.pkts, fmt_ts(st.ts)))
         print("  查看详情: pcapkit.py stream <pcap> <ID>")
+    if DECODE_ISSUES:
+        print("-" * 78)
+        print("解码提示: %s" % ", ".join("%s=%d" % kv for kv in DECODE_ISSUES.items()))
+        print("  br/zstd 需第三方库；解压失败多为报文被截断，可用 stream <ID> 看原始字节")
 
 
 def cmd_http(args):
@@ -685,6 +700,36 @@ def cmd_grep(args):
     print("\n命中 %d 个请求（模式: %s）" % (n, ", ".join(args.patterns)))
 
 
+def _hexdump(data, maxlen=1024):
+    data = data[:maxlen]
+    lines = []
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hexs = " ".join("%02x" % c for c in chunk)
+        asc = "".join(chr(c) if 32 <= c < 127 else "." for c in chunk)
+        lines.append("%08x  %-47s  |%s|" % (off, hexs, asc))
+    if len(data) >= maxlen:
+        lines.append("... 仅显示前 %d 字节" % maxlen)
+    return "\n".join(lines)
+
+
+def _as_text(data, limit):
+    """能当文本就给文本，不能就给十六进制。二进制证据必须走 hexdump，不能瞎猜编码。"""
+    head = data[:limit]
+    if not head:
+        return "(空)"
+    for enc in ("utf-8", "gbk"):
+        try:
+            return head.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return _hexdump(head)
+
+
+def _indent(text, prefix="  "):
+    return "\n".join(prefix + line for line in text.split("\n"))
+
+
 def cmd_stream(args):
     streams, meta = load(args.pcap, not args.no_cache)
     st = None
@@ -695,16 +740,47 @@ def cmd_stream(args):
     if st is None:
         print("没有 stream %d（该文件共 %d 条）" % (args.id, len(streams)))
         return
-    print("stream %d  %s ~ %s  %d 包  %s" % (st.sid, fmt_ts(st.ts), fmt_ts(st.ts_last),
-                                            st.pkts, human(st.nbytes)))
+    out = sys.stdout.buffer
+
+    def w(s):
+        # --raw 时摘要走 stderr，保证 stdout 是纯净字节流，可直接重定向为 .bin
+        target = sys.stderr.buffer if args.raw else out
+        target.write(s.encode("utf-8", "replace"))
+        target.flush()
+
+    w("stream %d  %s ~ %s  %d 包  %s\n" % (st.sid, fmt_ts(st.ts), fmt_ts(st.ts_last),
+                                          st.pkts, human(st.nbytes)))
     for ep, d in st.dirs.items():
-        print("\n##### %s:%d  (%d 包, %d 字节, 空洞 %d) #####" % (ep[0], ep[1], d["packets"],
-                                                             len(d["buf"]), st.gaps))
-        try:
-            txt = d["buf"].decode("utf-8")
-        except UnicodeDecodeError:
-            txt = d["buf"].decode("latin1")
-        print(txt[:args.limit].replace("\x00", "."))
+        buf = d["buf"]
+        w("\n##### %s:%d  (%d 包, %d 字节, 空洞 %d) #####\n" % (
+            ep[0], ep[1], d["packets"], len(buf), st.gaps))
+        if args.raw:                                  # 原样字节，允许管道重定向成 .bin
+            out.write(buf)
+            continue
+        msgs = parse_http(buf)
+        if not msgs:
+            sniff = _inflate(buf, "")
+            note = "，已按魔术字节嗅探解压" if sniff is not buf and len(sniff) != len(buf) else ""
+            w("（非 HTTP 报文%s）\n" % note)
+            w(_indent(_as_text(sniff, args.limit)) + "\n")
+            continue
+        for m in msgs:
+            kind = "响应" if m["first_line"].startswith("HTTP/") else "请求"
+            w("\n--- %s: %s ---\n" % (kind, m["first_line"]))
+            for k in ("host", "user-agent", "content-type", "content-encoding",
+                      "content-length", "transfer-encoding", "referer", "cookie"):
+                if k in m["headers"]:
+                    w("  %s: %s\n" % (k, m["headers"][k]))
+            body = m["body"]
+            tags = []
+            if m["headers"].get("content-encoding"):
+                tags.append("已解压 %s" % m["headers"]["content-encoding"])
+            if len(body) > args.limit:
+                tags.append("共 %d 字节, 截断显示" % len(body))
+            w("  [body %d 字节%s]\n" % (len(body), ("; " + ", ".join(tags)) if tags else ""))
+            if body:
+                w(_indent(_as_text(body, args.limit)) + "\n")
+    sys.stdout.flush()
 
 
 def _safe_name(s):
@@ -941,10 +1017,12 @@ def main(argv=None):
     p.add_argument("patterns", nargs="+")
     p.set_defaults(func=cmd_grep)
 
-    p = sub.add_parser("stream", help="还原指定 TCP 流")
+    p = sub.add_parser("stream", help="还原指定 TCP 流（默认解码 HTTP 与 gzip）")
     p.add_argument("pcap")
     p.add_argument("id", type=int)
-    p.add_argument("--limit", type=int, default=20000)
+    p.add_argument("--limit", type=int, default=8000, help="每个报文最多显示多少字节")
+    p.add_argument("--raw", action="store_true",
+                   help="输出线上原始字节（不做换行转换，可重定向为 .bin）")
     p.set_defaults(func=cmd_stream)
 
     p = sub.add_parser("export", help="导出请求/响应体")

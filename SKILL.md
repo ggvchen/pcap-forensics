@@ -57,7 +57,8 @@ python scripts/pcapkit.py summary 流量.pcap
 
 ```bash
 python scripts/pcapkit.py export 流量.pcap -d objects/     # 响应体 + 上传片段
-python scripts/pcapkit.py stream 流量.pcap 13706           # 还原单条流
+python scripts/pcapkit.py stream 流量.pcap 13706           # 单条流（默认已解 gzip，可读）
+python scripts/pcapkit.py stream 流量.pcap 13706 --raw     # 线上原始字节，可重定向为 .bin
 python scripts/pcapkit.py http   流量.pcap --csv req.csv   # 请求全量清单
 ```
 
@@ -81,8 +82,10 @@ python scripts/pcapkit.py report 流量.pcap -d report/     # 生成 report.md
 
 1. **payload 十有八九被 URL 编码**。`INTO OUTFILE` 在包里是 `INTO%20OUTFILE`，
    直接搜原文命中 0。检索必须带解码变体（`pcapkit grep` 已内置）。
-2. **gzip / chunked 不解等于没抓**。Wireshark 默认解；脚本要显式解，且用宽松模式
-   （`zlib.decompressobj(16+MAX_WBITS)`），严格模式遇截断包直接抛异常。
+2. **gzip / chunked 不解等于没抓**。`parse_http` 会按 `Content-Encoding` 解压，
+   声明缺失时再按魔术字节嗅探（`1f8b` / `78 01|9c|da|5e`）；`br`/`zstd` 解不了会在
+   `summary` 末尾提示，别当成「响应是空的」。遇到识别不出的二进制，用
+   `stream <ID> --raw` 拿原始字节，别用截图里的乱码下结论。
 3. **上传木马不在响应里**。只看响应体会得出「没上传成功」的错误结论。
 4. **抓包点决定谁是"攻击者"**。容器/NAT 里源地址常是网关（如 `172.17.0.1`），
    报告要写「抓包点视角」，不要当成真实攻击来源。

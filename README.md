@@ -57,7 +57,7 @@ python scripts/pcapkit.py report 流量.pcap -d report/
 | `summary` | 文件概览、会话排行、UA 404 率、八段攻击链命中 | — |
 | `http` | 列出全部 HTTP 请求，可导出 CSV | `--csv out.csv` `--limit N` |
 | `grep` | 请求行/头/体/响应体检索，自动比对 URL 解码后文本 | 多个模式并列 |
-| `stream` | 还原指定 stream 的双向字节流 | `--limit N` |
+| `stream` | 还原指定流：默认解码 HTTP 报文与 gzip，二进制自动转十六进制 | `--raw`（线上原始字节） `--limit N` |
 | `export` | 落盘响应体、POST 体、multipart 文件片段 | `--all` `--post` `--min-size` |
 | `report` | 生成 Markdown 取证报告 | `--max-events N` |
 
@@ -82,6 +82,18 @@ python scripts/pcapkit.py report 流量.pcap -d report/
 GIF89a
 <?php phpinfo(); ?>
 ```
+
+## 解压策略
+
+HTTP 实体在解析层就解开了，所以 `grep` / `export` / `report` / `stream` 拿到的都是明文：
+
+1. 按 `Content-Encoding` 解 `gzip` / `deflate`，`Transfer-Encoding: chunked` 先拆再解；
+2. 声明缺失或撒谎时，按魔术字节嗅探（`1f 8b` → gzip，`78 01|9c|da|5e` → zlib）；
+3. `br` / `zstd` 需要第三方库，遇到时不静默失败——`summary` 末尾会打印解码提示；
+4. 报文被截断时用宽松的 `decompressobj` 尽量解出前半段，彻底失败才退回原始字节。
+
+`stream --raw` 是唯一的例外：它输出不加任何处理的线上字节（摘要走 stderr），
+可以直接重定向成 `.bin` 做哈希比对或喂给其他工具。
 
 ## 设计取舍
 
