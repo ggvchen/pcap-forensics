@@ -776,10 +776,15 @@ def cmd_stream(args):
             if m["headers"].get("content-encoding"):
                 tags.append("已解压 %s" % m["headers"]["content-encoding"])
             if len(body) > args.limit:
-                tags.append("共 %d 字节, 截断显示" % len(body))
+                tags.append("仅显示前 %d 字节" % args.limit)
             w("  [body %d 字节%s]\n" % (len(body), ("; " + ", ".join(tags)) if tags else ""))
             if body:
                 w(_indent(_as_text(body, args.limit)) + "\n")
+                # 攻击 payload 基本都被 URL 编码，顺手解一份，省得自己翻译
+                if kind == "请求" and body.count(b"%") >= 8:
+                    dec = urllib.parse.unquote_to_bytes(body)
+                    if dec != body:
+                        w("  [URL 解码后]\n" + _indent(_as_text(dec, args.limit)) + "\n")
     sys.stdout.flush()
 
 
